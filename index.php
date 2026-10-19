@@ -328,6 +328,7 @@ button{font-family:inherit;color:inherit;background:none;border:none;cursor:poin
 .toast.err{border-left-color:var(--red)}
 .toast.good{border-left-color:var(--green)}
 .toast.bye{opacity:0;transform:translateX(20px)}
+.tapsound{display:none;position:fixed;left:50%;bottom:76px;transform:translateX(-50%);z-index:300;align-items:center;gap:8px;padding:11px 20px;border-radius:9px;border:1px solid #ffd9a0;background:linear-gradient(180deg,#ffc873,#f2a53a);color:#241602;font-size:12px;font-weight:600;letter-spacing:1.5px;box-shadow:0 12px 30px rgba(0,0,0,.55)}
 </style>
 </head>
 <body>
@@ -410,6 +411,7 @@ button{font-family:inherit;color:inherit;background:none;border:none;cursor:poin
 </div>
 
 <div class="toasts" id="toasts"></div>
+<button id="tapSound" class="tapsound mono">▶ TAP TO START VIDEO &amp; SOUND</button>
 
 <script>
 'use strict';
@@ -425,7 +427,7 @@ let role = 'viewer', want = false, joined = false, hbTimer = null;
 let localStream = null, cursor = 0, lastRoster = [], firstRoster = true;
 let prevIds = new Map(), unread = 0;
 const pcs = {}, tiles = {}, remoteStreams = {}, meters = new Map();
-let AC = null;
+let AC = null, camBusy = false;
 
 /* ---------------- utilities ---------------- */
 async function api(name, body) {
@@ -440,12 +442,108 @@ function toast(msg, kind) {
   t.className = 'toast ' + (kind || '');
   t.textContent = msg;
   $('#toasts').append(t);
-  setTimeout(() => { t.classList.add('bye'); setTimeout(() => t.remove(), 320); }, 4200);
+  setTimeout(() => { t.classList.add('bye'); setTimeout(() => t.remove(), 320); }, kind === 'err' ? 12000 : 4200);
 }
 function wakeAudio() {
   try { AC = AC || new (window.AudioContext || window.webkitAudioContext)(); AC.resume(); } catch (e) {}
 }
 setInterval(() => { $('#clock').textContent = new Date().toISOString().slice(11, 19) + ' UTC'; }, 1000);
+
+/* ---------------- capture (camera + mic) ----------------
+   Video and audio are requested together first; if that fails each one is retried on its own,
+   so a camera problem never silently degrades to audio-only and the real reason is reported. */
+const VIDEO_C = { width: { ideal: 640 }, height: { ideal: 480 } };
+const AUDIO_C = { echoCancellation: true, noiseSuppression: true };
+const inIframe = (() => { try { return window.self !== window.top; } catch (e) { return true; } })();
+
+function mediaErrText(err, what) {
+  const n = (err && err.name) || 'Error';
+  if (n === 'NotAllowedError' || n === 'SecurityError')
+    return what + ' blocked by the browser' + (inIframe ? ' (the embedding iframe needs allow="camera; microphone")' : ' (check the site permissions)');
+  if (n === 'NotFoundError' || n === 'OverconstrainedError') return 'No usable ' + what.toLowerCase() + ' found';
+  if (n === 'NotReadableError' || n === 'AbortError')
+    return what + ' could not start (' + n + ')' + (err.tried && err.tried.length ? ' — tried: ' + err.tried.join(', ') : '') +
+      '. It is in use by another app or tab (Zoom, Teams, FaceTime, OBS…) or stuck: close those apps, or restart the computer';
+  if (n === 'InsecureContext') return what + ' needs HTTPS or localhost';
+  return what + ' failed: ' + n + (err && err.message ? ' (' + err.message + ')' : '');
+}
+async function tryGUM(c) {
+  try { return { stream: await navigator.mediaDevices.getUserMedia(c) }; }
+  catch (err) { console.warn('getUserMedia', JSON.stringify(c), err && err.name, err && err.message); return { err }; }
+}
+async function getCamera() {
+  let r = await tryGUM({ video: VIDEO_C });
+  if (r.err && r.err.name !== 'NotAllowedError' && r.err.name !== 'SecurityError') {
+    const r2 = await tryGUM({ video: true });      // drop resolution hints (Safari / Continuity Camera)
+    if (r2.stream) r = r2;
+  }
+  if (r.stream || r.err.name === 'NotAllowedError' || r.err.name === 'SecurityError') return r;
+  const err0 = r.err;
+  // the default camera would not start (often a virtual / iPhone camera, or one held by another app):
+  // try every other camera on the machine before giving up
+  let cams = [];
+  try { cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput' && d.deviceId); } catch (e) {}
+  r.tried = [];
+  for (const d of cams) {
+    const name = d.label || ('camera ' + (r.tried.length + 1));
+    r.tried.push(name);
+    const r3 = await tryGUM({ video: { deviceId: { exact: d.deviceId } } });
+    if (r3.stream) { r3.device = name; return r3; }
+  }
+  try { err0.tried = r.tried; } catch (e) {}
+  return r;
+}
+async function getMic() {
+  let r = await tryGUM({ audio: AUDIO_C });
+  if (r.err && r.err.name !== 'NotAllowedError' && r.err.name !== 'SecurityError') {
+    const r2 = await tryGUM({ audio: true });
+    if (r2.stream) r = r2;
+  }
+  return r;
+}
+async function acquireMedia() {
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    const err = { name: 'InsecureContext' };
+    return { stream: null, videoErr: err, audioErr: err };
+  }
+  const both = await tryGUM({ video: VIDEO_C, audio: AUDIO_C });
+  if (both.stream && both.stream.getVideoTracks().length) return { stream: both.stream };
+  if (both.stream) both.stream.getTracks().forEach(t => t.stop());
+  const a = await getMic(), v = await getCamera();
+  const tracks = [...(v.stream ? v.stream.getVideoTracks() : []), ...(a.stream ? a.stream.getAudioTracks() : [])];
+  return { stream: tracks.length ? new MediaStream(tracks) : null, videoErr: v.err, audioErr: a.err, device: v.device };
+}
+function reportMedia(r) {
+  if (r.device) toast('Using camera: ' + r.device, 'good');
+  if (!r.stream) { toast(mediaErrText(r.videoErr, 'Camera') + ' — joining as a watcher', 'err'); return; }
+  if (r.videoErr) toast(mediaErrText(r.videoErr, 'Camera') + ' — mic only for now, press CAMERA to retry', 'err');
+  else if (r.audioErr) toast(mediaErrText(r.audioErr, 'Microphone') + ' — camera only', 'err');
+}
+function watchLocalTracks() {
+  if (!localStream) return;
+  for (const t of localStream.getVideoTracks()) {
+    if (t._watched) continue; t._watched = true;
+    // Safari lets one tab capture at a time: another tab taking the camera mutes this track
+    t.onmute = () => { renderSlots(); toast('Camera paused by the browser (another tab or app took it)', 'err'); };
+    t.onunmute = () => renderSlots();
+    t.onended = () => { renderSlots(); setDeckMedia(); };
+  }
+}
+
+/* Safari only autoplays unmuted media when the page itself is capturing; watchers get a tap-to-play bar. */
+let needTap = false;
+function playVideo(v) {
+  const p = v.play && v.play();
+  if (p && p.catch) p.catch(() => {
+    if (!v.muted) { v.muted = true; v._autoMuted = true; v.play().catch(() => {}); }
+    if (!needTap) { needTap = true; $('#tapSound').style.display = 'flex'; }
+  });
+}
+function unlockPlayback() {
+  wakeAudio();
+  $$('video').forEach(v => { if (v._autoMuted) { v.muted = false; v._autoMuted = false; } v.play && v.play().catch(() => {}); });
+  needTap = false; $('#tapSound').style.display = 'none';
+}
 
 /* ---------------- entrance: live room status ---------------- */
 try { $('#nameInput').value = localStorage.getItem('s6name') || ''; } catch (e) {}
@@ -477,15 +575,8 @@ async function enter(withCam) {
   wakeAudio();
 
   if (withCam) {
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 } },
-        audio: { echoCancellation: true, noiseSuppression: true }
-      });
-    } catch (err) {
-      try { localStream = await navigator.mediaDevices.getUserMedia({ audio: true }); toast('Camera blocked — joining mic-only', 'err'); }
-      catch (err2) { localStream = null; toast('No camera or mic — joining as a watcher', 'err'); }
-    }
+    const r = await acquireMedia();
+    localStream = r.stream; reportMedia(r); watchLocalTracks();
   }
   want = withCam && !!localStream && localStream.getTracks().length > 0;
 
@@ -516,9 +607,10 @@ function applyHb(r) {
 async function onPromoted(seat) {
   wakeAudio();
   if (!localStream) {
-    try { localStream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 } }, audio: { echoCancellation: true, noiseSuppression: true } }); }
-    catch (e) { try { localStream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch (e2) { localStream = null; } }
-    if (!localStream) { want = false; toast('A seat opened, but no camera was found', 'err'); return; }
+    const r = await acquireMedia();
+    localStream = r.stream; watchLocalTracks();
+    if (!localStream) { want = false; toast('A seat opened, but ' + mediaErrText(r.videoErr, 'Camera').toLowerCase(), 'err'); return; }
+    reportMedia(r);
   }
   publish();
   toast('YOU ARE ON AIR — SEAT 0' + (((seat ?? 0)) + 1), 'good');
@@ -529,9 +621,10 @@ function onDemoted() {
   setDeckMedia(); renderSlots();
 }
 function publish() {
+  // add every local track a peer is not sending yet (a camera turned on later included)
   for (const pid in pcs) {
-    const pc = pcs[pid];
-    if (!pc.getSenders().some(s => s.track)) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    const pc = pcs[pid], sent = new Set(pc.getSenders().map(s => s.track).filter(Boolean));
+    localStream.getTracks().forEach(t => { if (!sent.has(t)) pc.addTrack(t, localStream); });
   }
   reconcile(); renderSlots(); setDeckMedia();
 }
@@ -571,7 +664,7 @@ function getPC(pid) {
     const st = e.streams[0] || new MediaStream([e.track]);
     remoteStreams[pid] = st;
     const tile = tiles[pid];
-    if (tile) { const v = tile.querySelector('video'); if (v.srcObject !== st) v.srcObject = st; }
+    if (tile) { const v = tile.querySelector('video'); if (v.srcObject !== st) v.srcObject = st; playVideo(v); }
     syncVU();
   };
   pc.onnegotiationneeded = async () => {
@@ -636,7 +729,7 @@ function makeTile(pid) {
     '<div class="nocam-ov"><span>CAMERA MUTED</span></div>' +
     '<div class="tag mono"></div>' +
     '<div class="plate"><span class="nm"></span><span class="live"><i></i>LIVE</span></div>';
-  if (pid === me.id) { const v = el.querySelector('video'); v.muted = true; v.classList.add('mirror'); }
+  if (pid === me.id) { const v = el.querySelector('video'); v.muted = true; v.setAttribute('muted', ''); v.classList.add('mirror'); }
   return el;
 }
 
@@ -657,12 +750,12 @@ function renderSlots() {
     body.append(tile);
     const v = tile.querySelector('video');
     if (p.id === me.id) {
-      if (v.srcObject !== localStream) v.srcObject = localStream;
-      const live = localStream && localStream.getVideoTracks().some(t => t.enabled && t.readyState === 'live');
+      if (v.srcObject !== localStream) { v.srcObject = localStream; if (localStream) playVideo(v); }
+      const live = localStream && localStream.getVideoTracks().some(t => t.enabled && !t.muted && t.readyState === 'live');
       tile.classList.toggle('nocam', !live);
     } else {
       const st = remoteStreams[p.id] || null;
-      if (st && v.srcObject !== st) v.srcObject = st;
+      if (st && v.srcObject !== st) { v.srcObject = st; playVideo(v); }
     }
   });
   syncVU();
@@ -694,17 +787,34 @@ $('#seatChip').onclick = () => {
 
 function setDeckMedia() {
   $('#btnMic').classList.toggle('dead', !localStream || !localStream.getAudioTracks().length);
-  $('#btnCam').classList.toggle('dead', !localStream || !localStream.getVideoTracks().length);
-  const vt = localStream && localStream.getVideoTracks()[0];
+  $('#btnCam').classList.toggle('dead', !localStream || camBusy);   // no video yet = clickable, asks again
+  const vt = localStream && localStream.getVideoTracks().find(t => t.readyState === 'live');
   const at = localStream && localStream.getAudioTracks()[0];
   $('#btnCam').classList.toggle('on', !!(vt && vt.enabled));
   $('#btnCam').classList.toggle('off', !!(vt && !vt.enabled));
   $('#btnMic').classList.toggle('on', !!(at && at.enabled));
   $('#btnMic').classList.toggle('off', !!(at && !at.enabled));
 }
-$('#btnCam').onclick = () => {
-  const t = localStream && localStream.getVideoTracks()[0]; if (!t) return;
-  t.enabled = !t.enabled; renderSlots(); setDeckMedia();
+$('#btnCam').onclick = async () => {
+  if (!localStream || camBusy) return;
+  const t = localStream.getVideoTracks().find(x => x.readyState === 'live');
+  if (t) { t.enabled = !t.enabled; renderSlots(); setDeckMedia(); return; }
+  // joined mic-only (or the camera ended): ask for it again, from this click
+  camBusy = true; setDeckMedia();
+  const r = await getCamera();
+  camBusy = false;
+  if (!r.stream) { toast(mediaErrText(r.err, 'Camera'), 'err'); setDeckMedia(); return; }
+  if (r.device) toast('Using camera: ' + r.device, 'good');
+  localStream.getVideoTracks().forEach(x => localStream.removeTrack(x));
+  const nt = r.stream.getVideoTracks()[0];
+  localStream.addTrack(nt); watchLocalTracks();
+  for (const pid in pcs) {
+    const old = pcs[pid].getSenders().find(s => s.track && s.track.kind === 'video');
+    if (old) old.replaceTrack(nt); else pcs[pid].addTrack(nt, localStream);   // addTrack renegotiates
+  }
+  const sv = tiles[me.id] && tiles[me.id].querySelector('video');
+  if (sv) { sv.srcObject = null; sv.srcObject = localStream; playVideo(sv); }
+  toast('Camera on', 'good'); renderSlots(); setDeckMedia();
 };
 $('#btnMic').onclick = () => {
   const t = localStream && localStream.getAudioTracks()[0]; if (!t) return;
@@ -778,6 +888,7 @@ function bumpChat() {
     const b = $('#btnChat .badge'); b.textContent = unread; b.style.display = 'inline-flex';
   }
 }
+$('#tapSound').onclick = unlockPlayback;
 $('#btnChat').onclick = () => {
   $('#app').classList.toggle('chat-open');
   unread = 0; $('#btnChat .badge').style.display = 'none';
