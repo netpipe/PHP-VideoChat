@@ -15,6 +15,11 @@ define('SEATS', 6);
 define('STALE_AFTER', 15);      // seconds without heartbeat -> ejected
 define('POLL_SECONDS', 6);      // long-poll window
 define('DATA_DIR', getenv('CAMROOM_DATA') ?: __DIR__ . '/.studio6');
+// TURN relay: needed when people are on different networks (mobile data, offices, strict routers).
+// Without it those pairs see each other's tile but only black video. Comma-separate several URLs.
+define('TURN_URLS', getenv('CAMROOM_TURN_URLS') ?: '');   // e.g. 'turn:turn.example.com:3478,turns:turn.example.com:443?transport=tcp'
+define('TURN_USER', getenv('CAMROOM_TURN_USER') ?: '');
+define('TURN_PASS', getenv('CAMROOM_TURN_PASS') ?: '');
 
 if (!is_dir(DATA_DIR)) @mkdir(DATA_DIR, 0777, true);
 
@@ -147,6 +152,8 @@ if (isset($_GET['api'])) {
 
   echo json_encode(['error' => 'unknown api']); exit;
 }
+$ice = [['urls' => ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302']]];
+if (TURN_URLS !== '') $ice[] = ['urls' => array_values(array_filter(array_map('trim', explode(',', TURN_URLS)))), 'username' => TURN_USER, 'credential' => TURN_PASS];
 ?>
 <!doctype html>
 <html lang="en">
@@ -274,6 +281,9 @@ button{font-family:inherit;color:inherit;background:none;border:none;cursor:poin
 @keyframes blink{50%{opacity:.15}}
 .tile .nocam-ov{position:absolute;inset:0;z-index:3;display:none;align-items:center;justify-content:center;background:repeating-linear-gradient(45deg,#0d1218 0 14px,#111820 14px 28px)}
 .tile.nocam .nocam-ov{display:flex}
+.tile .link{position:absolute;top:8px;right:8px;z-index:4;max-width:calc(100% - 110px);font-size:9.5px;letter-spacing:1.4px;color:var(--amber);background:rgba(7,9,13,.8);border:1px solid var(--line2);border-radius:5px;padding:3px 8px}
+.tile .link.bad{color:#ff8a80;border-color:#7e2a22}
+.tile .link:empty{display:none}
 .tile .nocam-ov span{font-family:var(--mono);font-size:10.5px;letter-spacing:3px;color:var(--faint);border:1px solid var(--line2);padding:7px 13px;border-radius:6px;background:rgba(9,12,16,.8)}
 .slot.talking{border-color:var(--green);box-shadow:0 0 0 1px var(--green),0 0 26px -6px rgba(95,208,104,.55)}
 
@@ -420,7 +430,8 @@ const $  = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
 const API = '?api=';
 const SEATS = 6;
-const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const ICE = { iceServers: <?= json_encode($ice, JSON_UNESCAPED_SLASHES) ?> };
+if (new URLSearchParams(location.search).has('relay')) ICE.iceTransportPolicy = 'relay';   // ?relay = test the TURN server alone
 
 const me = { id: 'u' + Math.random().toString(36).slice(2, 10), name: '' };
 let role = 'viewer', want = false, joined = false, hbTimer = null;
@@ -428,14 +439,23 @@ let localStream = null, cursor = 0, lastRoster = [], firstRoster = true;
 let prevIds = new Map(), unread = 0;
 const pcs = {}, tiles = {}, remoteStreams = {}, meters = new Map();
 let AC = null, camBusy = false;
+const linkFails = {};
 
 /* ---------------- utilities ---------------- */
 async function api(name, body) {
   const opt = body === undefined ? {} :
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
-  const r = await fetch(API + name, opt);
-  if (!r.ok) throw new Error('http ' + r.status);
-  return r.json();
+  return checkSig(await fetch(API + name, opt));
+}
+let sigWarned = 0;
+function checkSig(r) {   // the hosting can answer with an error or a security-check page instead of JSON
+  let why = '';
+  if (!r.ok) why = 'the server answered HTTP ' + r.status + ' (busy or limited hosting?)';
+  else if (!/json/i.test(r.headers.get('content-type') || '')) why = 'the server answered with a web page instead of chat data (hosting security check?)';
+  if (!why) return r.json();
+  console.warn('signaling:', why);
+  if (Date.now() - sigWarned > 60000) { sigWarned = Date.now(); toast('Connection problem: ' + why + ' — try reloading the page', 'err'); }
+  throw new Error(why);
 }
 function toast(msg, kind) {
   const t = document.createElement('div');
@@ -657,6 +677,7 @@ function getPC(pid) {
   const pc = new RTCPeerConnection(ICE);
   pc._polite = me.id > pid;
   pc._making = false;
+  pc._t0 = Date.now();
   pcs[pid] = pc;
   if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
   pc.onicecandidate = e => { if (e.candidate) signal(pid, 'ice', e.candidate.toJSON()); };
@@ -671,8 +692,12 @@ function getPC(pid) {
     try { pc._making = true; await pc.setLocalDescription(); signal(pid, 'sdp', pc.localDescription); }
     catch (e) {} finally { pc._making = false; }
   };
+  pc.oniceconnectionstatechange = () => updateLink(pid);
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed') { closePeer(pid); setTimeout(reconcile, 600); }
+    const st = pc.connectionState;
+    if (st === 'connected') delete linkFails[pid];
+    if (st === 'failed') { linkFails[pid] = (linkFails[pid] || 0) + 1; console.warn('peer link failed', pid, linkFails[pid]); closePeer(pid); setTimeout(reconcile, 600); }
+    updateLink(pid);
   };
   return pc;
 }
@@ -686,7 +711,7 @@ async function pollLoop() {
       const t = setTimeout(() => ctl.abort(), 12000);
       const r = await fetch(API + 'poll&me=' + encodeURIComponent(me.id) + '&after=' + cursor, { signal: ctl.signal });
       clearTimeout(t);
-      const j = await r.json();
+      const j = await checkSig(r);
       if (!joined) return;
       if (j && Array.isArray(j.msgs)) {
         for (const m of j.msgs) chain = chain.then(() => handleMsg(m)).catch(() => {});
@@ -708,15 +733,26 @@ async function handleMsg(m) {
         if (collision && !pc._polite) return;                    // impolite side wins
         if (collision) { try { await pc.setLocalDescription({ type: 'rollback' }); } catch (e) {} }
         await pc.setRemoteDescription(d);
+        await flushIce(pc);
         await pc.setLocalDescription();
         signal(m.from, 'sdp', pc.localDescription);
       } else {
         await pc.setRemoteDescription(d);
+        await flushIce(pc);
       }
     } catch (e) {}
     return;
   }
-  if (m.type === 'ice') { try { await getPC(m.from).addIceCandidate(m.data); } catch (e) {} }
+  if (m.type === 'ice') {
+    // signaling requests can overtake each other on a busy server: a candidate may arrive before its offer
+    const pc = getPC(m.from);
+    if (!pc.remoteDescription) { (pc._iceQ = pc._iceQ || []).push(m.data); return; }
+    try { await pc.addIceCandidate(m.data); } catch (e) {}
+  }
+}
+async function flushIce(pc) {
+  const q = pc._iceQ || []; pc._iceQ = [];
+  for (const c of q) { try { await pc.addIceCandidate(c); } catch (e) {} }
 }
 
 /* ---------------- rendering ---------------- */
@@ -727,9 +763,11 @@ function makeTile(pid) {
   el.className = 'tile';
   el.innerHTML = '<video autoplay playsinline></video>' +
     '<div class="nocam-ov"><span>CAMERA MUTED</span></div>' +
+    '<div class="link mono"></div>' +
     '<div class="tag mono"></div>' +
     '<div class="plate"><span class="nm"></span><span class="live"><i></i>LIVE</span></div>';
   if (pid === me.id) { const v = el.querySelector('video'); v.muted = true; v.setAttribute('muted', ''); v.classList.add('mirror'); }
+  else ['loadeddata', 'resize', 'playing'].forEach(ev => el.querySelector('video').addEventListener(ev, () => updateLink(pid)));
   return el;
 }
 
@@ -756,10 +794,30 @@ function renderSlots() {
     } else {
       const st = remoteStreams[p.id] || null;
       if (st && v.srcObject !== st) { v.srcObject = st; playVideo(v); }
+      updateLink(p.id);
     }
   });
   syncVU();
 }
+
+/* what a remote tile is waiting for, so a black tile is never a mystery */
+function updateLink(pid) {
+  const t = tiles[pid]; if (!t || pid === me.id) return;
+  const el = t.querySelector('.link'), v = t.querySelector('video'), pc = pcs[pid];
+  const st = pc ? (pc.connectionState || pc.iceConnectionState) : 'new';
+  let txt = '', bad = false;
+  if (st === 'connected' || st === 'completed') {
+    const s = remoteStreams[pid];
+    if (s && !s.getVideoTracks().length) txt = 'AUDIO ONLY';
+    else if (!v.videoWidth) txt = 'WAITING FOR VIDEO…';
+  } else if (st === 'failed' || linkFails[pid]) { txt = 'NO DIRECT LINK — RETRY ' + (linkFails[pid] || 1) + ' · NEEDS A TURN SERVER'; bad = true; }
+  else if (st === 'disconnected') txt = 'RECONNECTING…';
+  else if (pc && Date.now() - pc._t0 > 15000) { txt = 'NO LINK AFTER 15 S · MAY NEED A TURN SERVER'; bad = true; }   // some browsers never report "failed"
+  else txt = 'CONNECTING…';
+  if (el.textContent !== txt) el.textContent = txt;
+  el.classList.toggle('bad', bad);
+}
+setInterval(() => Object.keys(tiles).forEach(updateLink), 1500);
 
 function updateHeader() {
   const cams = lastRoster.filter(p => p.role === 'cam');
